@@ -1,0 +1,7 @@
+{
+  "name": "Jadwal Otomatis",
+  "description": "A smart automated class scheduler powered by Gemini AI, featuring teacher management, subject constraints, and location-based amenities search.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
