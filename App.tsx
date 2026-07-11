@@ -5,23 +5,32 @@ import { ScheduleResult } from './components/ScheduleResult';
 import { NearbyPlaces } from './components/NearbyPlaces';
 import { Teacher, ScheduleResponse, AppStatus, TimeSettings } from './types';
 import { generateSchedule } from './services/geminiService';
-import { BrainCircuit, Sparkles, CalendarDays, Loader2, RotateCcw, Save, FlaskConical, Bell, X, CheckCircle, AlertCircle, Upload, Download } from 'lucide-react';
+import { downloadExcelTemplate, parseExcelToTeachers } from './services/excelService';
+import { BrainCircuit, Sparkles, CalendarDays, Loader2, RotateCcw, Save, FlaskConical, Bell, X, CheckCircle, AlertCircle, Upload, Download, FileSpreadsheet, Cpu } from 'lucide-react';
 
 const DAYS_OF_WEEK = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
 
 const LOADING_MESSAGES = [
-  "Menganalisis ketersediaan guru...",
-  "Menghitung slot waktu presisi...",
-  "Mengalokasikan ruangan laboratorium...",
-  "Memeriksa bentrok jadwal...",
-  "Menyeimbangkan beban kerja guru...",
-  "Menyisipkan waktu istirahat & sholat...",
-  "Finalisasi jadwal pelajaran..."
+  "Menginisialisasi Algoritma Anti-Bentrok...",
+  "Memvalidasi matriks guru & ruangan...",
+  "Menghitung kombinasi slot waktu per hari (Senin vs Jumat)...",
+  "Melakukan tes permutasi jadwal maraton...",
+  "Memverifikasi constraint ketersediaan hari...",
+  "Finalisasi grid jadwal pelajaran..."
 ];
 
 const DEFAULT_TIME_SETTINGS: TimeSettings = {
   startHour: '07:00',
   endHour: '15:00',
+  lessonDuration: 40, // Default duration per JP
+  dailyOverrides: {
+    'Senin': { start: '07:00', end: '15:00' },
+    'Selasa': { start: '07:00', end: '15:00' },
+    'Rabu': { start: '07:00', end: '15:00' },
+    'Kamis': { start: '07:00', end: '15:00' },
+    'Jumat': { start: '07:00', end: '11:00' }, // Default Jumat Pulang Pagi
+    'Sabtu': { start: '07:00', end: '12:00' }
+  },
   breaks: [
     { id: '1', name: 'Istirahat 1', startTime: '10:00', endTime: '10:20' },
     { id: '2', name: 'Sholat Dzuhur / Istirahat 2', startTime: '12:00', endTime: '12:40' }
@@ -52,7 +61,10 @@ const App: React.FC = () => {
   const [timeSettings, setTimeSettings] = useState<TimeSettings>(DEFAULT_TIME_SETTINGS);
   
   const [loadingMsgIndex, setLoadingMsgIndex] = useState(0);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  
+  // Refs for file inputs
+  const backupInputRef = useRef<HTMLInputElement>(null);
+  const excelInputRef = useRef<HTMLInputElement>(null);
 
   // Toast State
   const [toasts, setToasts] = useState<ToastMsg[]>([]);
@@ -63,7 +75,7 @@ const App: React.FC = () => {
   };
   const removeToast = (id: number) => setToasts(prev => prev.filter(t => t.id !== id));
 
-  // --- PERSISTENCE LOGIC ---
+  // --- PERSISTENCE LOGIC (DEBOUNCED) ---
   useEffect(() => {
     try {
         const savedTeachers = localStorage.getItem('autoSchedule_teachers');
@@ -71,19 +83,36 @@ const App: React.FC = () => {
         const savedDays = localStorage.getItem('autoSchedule_days');
         
         if (savedTeachers) setTeachers(JSON.parse(savedTeachers));
-        if (savedTime) setTimeSettings(JSON.parse(savedTime));
+        if (savedTime) {
+            const parsedTime = JSON.parse(savedTime);
+            // DATA MIGRATION: Ensure structure matches current version
+            if (!parsedTime.dailyOverrides) {
+                parsedTime.dailyOverrides = DEFAULT_TIME_SETTINGS.dailyOverrides;
+            }
+            if (!parsedTime.lessonDuration) {
+                parsedTime.lessonDuration = 40;
+            }
+            setTimeSettings(parsedTime);
+        }
         if (savedDays) setSelectedDays(JSON.parse(savedDays));
     } catch (e) {
         console.error("Failed to load local storage data", e);
     }
   }, []);
 
+  // Debounced Saves to prevent UI lag on rapid input
   useEffect(() => {
-    localStorage.setItem('autoSchedule_teachers', JSON.stringify(teachers));
+    const handler = setTimeout(() => {
+        localStorage.setItem('autoSchedule_teachers', JSON.stringify(teachers));
+    }, 500);
+    return () => clearTimeout(handler);
   }, [teachers]);
 
   useEffect(() => {
-    localStorage.setItem('autoSchedule_time', JSON.stringify(timeSettings));
+    const handler = setTimeout(() => {
+        localStorage.setItem('autoSchedule_time', JSON.stringify(timeSettings));
+    }, 500);
+    return () => clearTimeout(handler);
   }, [timeSettings]);
 
   useEffect(() => {
@@ -91,11 +120,11 @@ const App: React.FC = () => {
   }, [selectedDays]);
 
   useEffect(() => {
-    let interval: NodeJS.Timeout;
+    let interval: ReturnType<typeof setInterval>;
     if (status === AppStatus.GENERATING) {
       interval = setInterval(() => {
         setLoadingMsgIndex((prev) => (prev + 1) % LOADING_MESSAGES.length);
-      }, 2500);
+      }, 1000); // Faster updates for algorithm feel
     }
     return () => clearInterval(interval);
   }, [status]);
@@ -112,16 +141,25 @@ const App: React.FC = () => {
     setSchedule(null);
     setLoadingMsgIndex(0);
 
-    try {
-      const result = await generateSchedule(teachers, selectedDays, timeSettings);
-      setSchedule(result);
-      setStatus(AppStatus.SUCCESS);
-      addToast("Jadwal berhasil dibuat!", "success");
-    } catch (error: any) {
-      console.error(error);
-      setStatus(AppStatus.ERROR);
-      addToast(error.message || "Terjadi kesalahan saat membuat jadwal.", "error");
-    }
+    // Give UI a moment to show loading before blocking thread with algorithm
+    setTimeout(async () => {
+        try {
+            const result = await generateSchedule(teachers, selectedDays, timeSettings);
+            setSchedule(result);
+            setStatus(AppStatus.SUCCESS);
+            
+            // Check if result has unassigned items (implied by title)
+            if (result.scheduleName.includes("100%")) {
+                addToast("Jadwal Optimal berhasil dibuat!", "success");
+            } else {
+                addToast("Jadwal selesai, beberapa jam mungkin tidak muat.", "info");
+            }
+        } catch (error: any) {
+            console.error(error);
+            setStatus(AppStatus.ERROR);
+            addToast(error.message || "Terjadi kesalahan saat membuat jadwal.", "error");
+        }
+    }, 500);
   };
 
   const handleResetData = () => {
@@ -136,7 +174,7 @@ const App: React.FC = () => {
       }
   };
 
-  // --- EXPORT / IMPORT LOGIC ---
+  // --- JSON BACKUP / RESTORE ---
   const handleExportData = () => {
     const data = {
       teachers,
@@ -144,7 +182,7 @@ const App: React.FC = () => {
       selectedDays,
       schedule, // Include current schedule result
       exportDate: new Date().toISOString(),
-      appVersion: "2.0-dewa"
+      appVersion: "2.6-duration-update"
     };
     const jsonString = JSON.stringify(data, null, 2);
     const blob = new Blob([jsonString], { type: "application/json" });
@@ -155,14 +193,14 @@ const App: React.FC = () => {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    addToast("Data berhasil disimpan (Backup)", "success");
+    addToast("Backup Data berhasil disimpan.", "success");
   };
 
-  const handleImportClick = () => {
-    fileInputRef.current?.click();
+  const handleBackupImportClick = () => {
+    backupInputRef.current?.click();
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleBackupFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -177,16 +215,56 @@ const App: React.FC = () => {
             setSchedule(json.schedule);
             setStatus(AppStatus.SUCCESS);
         }
-        addToast("Data berhasil dipulihkan (Restore)", "success");
+        addToast("Data berhasil dipulihkan (Restore).", "success");
       } catch (err) {
         console.error(err);
         addToast("File backup tidak valid.", "error");
       }
     };
     reader.readAsText(file);
-    // Reset input
     e.target.value = '';
   };
+
+  // --- EXCEL LOGIC ---
+  const handleDownloadTemplate = () => {
+      downloadExcelTemplate();
+      addToast("Template Excel diunduh. Silakan isi dan upload kembali.", "info");
+  };
+
+  const handleExcelImportClick = () => {
+      excelInputRef.current?.click();
+  };
+
+  const handleExcelFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      try {
+          const newTeachers = await parseExcelToTeachers(file);
+          if (newTeachers.length === 0) {
+              addToast("Tidak ada data valid ditemukan di Excel.", "error");
+              return;
+          }
+          
+          if (teachers.length > 0) {
+              if (confirm(`Ditemukan ${newTeachers.length} guru di Excel. Timpa data lama? (Cancel untuk menggabungkan)`)) {
+                  setTeachers(newTeachers);
+              } else {
+                  // Merge logic: Add only if ID/Code doesn't exist, or just append
+                  setTeachers(prev => [...prev, ...newTeachers]);
+              }
+          } else {
+              setTeachers(newTeachers);
+          }
+          addToast(`Berhasil mengimpor ${newTeachers.length} data guru dari Excel.`, "success");
+      } catch (error) {
+          console.error(error);
+          addToast("Gagal membaca file Excel. Pastikan format sesuai template.", "error");
+      } finally {
+          e.target.value = '';
+      }
+  };
+
 
   const loadSampleData = () => {
     if (teachers.length > 0 && !confirm("Timpa data saat ini dengan data contoh?")) return;
@@ -235,23 +313,18 @@ const App: React.FC = () => {
     <div className="min-h-screen bg-slate-100 pb-12 relative font-inter">
       <ToastContainer toasts={toasts} remove={removeToast} />
       
-      {/* Hidden File Input for Restore */}
-      <input 
-        type="file" 
-        ref={fileInputRef} 
-        onChange={handleFileChange} 
-        accept=".json" 
-        className="hidden" 
-      />
+      {/* Hidden Inputs */}
+      <input type="file" ref={backupInputRef} onChange={handleBackupFileChange} accept=".json" className="hidden" />
+      <input type="file" ref={excelInputRef} onChange={handleExcelFileChange} accept=".xlsx, .xls" className="hidden" />
 
       {/* Cinematic Loading Overlay */}
       {status === AppStatus.GENERATING && (
         <div className="fixed inset-0 z-50 bg-slate-900/90 backdrop-blur-md flex flex-col items-center justify-center text-white animate-fade-in">
            <div className="relative">
               <div className="absolute inset-0 bg-indigo-500 blur-xl opacity-30 rounded-full animate-pulse"></div>
-              <Loader2 size={64} className="animate-spin text-indigo-400 relative z-10" />
+              <Cpu size={64} className="animate-spin text-indigo-400 relative z-10" />
            </div>
-           <h2 className="text-3xl font-bold mt-8 mb-2 tracking-tight">AI Sedang Bekerja</h2>
+           <h2 className="text-3xl font-bold mt-8 mb-2 tracking-tight">Sedang Menghitung Algoritma</h2>
            <p className="text-indigo-200 text-lg animate-pulse min-h-[30px] text-center max-w-md px-4">
               {LOADING_MESSAGES[loadingMsgIndex]}
            </p>
@@ -270,28 +343,51 @@ const App: React.FC = () => {
             </div>
             <div>
                 <h1 className="text-2xl font-bold text-slate-800 tracking-tight leading-none">Jadwal Otomatis</h1>
-                <p className="text-xs text-slate-500 font-medium mt-1">Karya Riz Bennington</p>
+                <p className="text-xs text-slate-500 font-medium mt-1">Algoritma Anti-Bentrok v2.6 (Duration Control)</p>
             </div>
           </div>
-          <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+          
+          <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto justify-end">
+             {/* Excel Actions */}
+             <div className="flex bg-emerald-50 rounded-lg p-1 border border-emerald-100 mr-2">
+                 <button 
+                    onClick={handleDownloadTemplate}
+                    className="text-emerald-700 hover:bg-white hover:shadow-sm px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all"
+                    title="Download Template Excel"
+                 >
+                    <FileSpreadsheet size={14} /> Template
+                 </button>
+                 <div className="w-px bg-emerald-200 my-1"></div>
+                 <button 
+                    onClick={handleExcelImportClick}
+                    className="text-emerald-700 hover:bg-white hover:shadow-sm px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all"
+                    title="Upload Data Excel"
+                 >
+                    <Upload size={14} /> Import Excel
+                 </button>
+             </div>
+
+             {/* System Actions */}
              <button 
-                onClick={handleImportClick}
-                className="text-slate-600 hover:text-indigo-600 transition-colors flex items-center gap-1.5 text-xs font-semibold px-4 py-2 rounded-lg border border-slate-200 hover:bg-indigo-50 hover:border-indigo-100 bg-white shadow-sm"
-                title="Restore Backup"
+                onClick={handleBackupImportClick}
+                className="text-slate-600 hover:text-indigo-600 transition-colors flex items-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-lg border border-slate-200 hover:bg-indigo-50 hover:border-indigo-100 bg-white shadow-sm"
+                title="Restore Backup JSON"
              >
-                <Upload size={14} /> Buka File
+                <Upload size={14} /> Restore
              </button>
              <button 
                 onClick={handleExportData}
-                className="text-slate-600 hover:text-indigo-600 transition-colors flex items-center gap-1.5 text-xs font-semibold px-4 py-2 rounded-lg border border-slate-200 hover:bg-indigo-50 hover:border-indigo-100 bg-white shadow-sm"
-                title="Download Backup"
+                className="text-slate-600 hover:text-indigo-600 transition-colors flex items-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-lg border border-slate-200 hover:bg-indigo-50 hover:border-indigo-100 bg-white shadow-sm"
+                title="Download Backup JSON"
              >
-                <Download size={14} /> Simpan File
+                <Download size={14} /> Backup
              </button>
-             <div className="h-6 w-px bg-slate-300 mx-1"></div>
+             
+             <div className="h-6 w-px bg-slate-300 mx-1 hidden sm:block"></div>
+             
              <button 
                 onClick={handleResetData}
-                className="text-slate-500 hover:text-red-600 transition-colors flex items-center gap-1.5 text-xs font-semibold px-4 py-2 rounded-lg border border-slate-200 hover:bg-red-50 hover:border-red-100 bg-white shadow-sm"
+                className="text-slate-500 hover:text-red-600 transition-colors flex items-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-lg border border-slate-200 hover:bg-red-50 hover:border-red-100 bg-white shadow-sm"
              >
                 <RotateCcw size={14} /> Reset
              </button>
@@ -344,8 +440,8 @@ const App: React.FC = () => {
               disabled={status === AppStatus.GENERATING || teachers.length === 0}
               className="w-full py-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl shadow-xl shadow-indigo-200 hover:shadow-2xl hover:scale-[1.01] active:scale-[0.99] transform transition-all font-bold text-lg flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed disabled:transform-none disabled:shadow-none"
             >
-               {status === AppStatus.GENERATING ? <Loader2 className="animate-spin" /> : <Sparkles size={20} className="text-yellow-300" />} 
-               Buat Jadwal Otomatis
+               {status === AppStatus.GENERATING ? <Loader2 className="animate-spin" /> : <Cpu size={20} className="text-yellow-300" />} 
+               Proses Algoritma
             </button>
           </div>
 
@@ -356,14 +452,17 @@ const App: React.FC = () => {
                 <div className="bg-indigo-50 p-8 rounded-full mb-6 animate-pulse ring-8 ring-indigo-50/50">
                   <CalendarDays className="text-indigo-500" size={64} />
                 </div>
-                <h3 className="text-2xl font-bold text-slate-800 mb-3">Siap Membuat Jadwal Dewa</h3>
+                <h3 className="text-2xl font-bold text-slate-800 mb-3">Sistem Penjadwalan Cerdas</h3>
                 <p className="text-slate-500 max-w-md mx-auto leading-relaxed mb-8">
-                  Sistem AI kami siap menyusun jadwal presisi, anti-bentrok, dan seimbang.<br/>
-                  Isi data di sebelah kiri untuk memulai, atau gunakan data contoh.
+                  Menggunakan <b>Algorithm</b> untuk menjamin jadwal tanpa bentrok.<br/>
+                  Sekarang mendukung pengaturan jam pulang berbeda tiap hari.
                 </p>
                 <div className="flex gap-3 justify-center">
                     <button onClick={loadSampleData} className="text-sm font-semibold text-indigo-700 bg-indigo-50 px-5 py-2.5 rounded-full border border-indigo-100 hover:bg-indigo-100 transition-colors flex items-center gap-2">
                         <FlaskConical size={16}/> Coba Data Dummy
+                    </button>
+                    <button onClick={handleDownloadTemplate} className="text-sm font-semibold text-emerald-700 bg-emerald-50 px-5 py-2.5 rounded-full border border-emerald-100 hover:bg-emerald-100 transition-colors flex items-center gap-2">
+                        <FileSpreadsheet size={16}/> Download Template
                     </button>
                 </div>
               </div>

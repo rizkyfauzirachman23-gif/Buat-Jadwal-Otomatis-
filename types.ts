@@ -1,3 +1,4 @@
+
 export interface TeacherAssignment {
   id: string;
   subjectName: string;
@@ -31,8 +32,11 @@ export interface SchoolBreak {
 }
 
 export interface TimeSettings {
-  startHour: string; // e.g. "07:00"
-  endHour: string;   // e.g. "15:00"
+  startHour: string; // Default global start
+  endHour: string;   // Default global end
+  lessonDuration: number; // New: Duration per JP in minutes (e.g., 40, 45)
+  // Override per hari: Key = "Senin", Value = { start: "07:00", end: "15:00" }
+  dailyOverrides?: Record<string, { start: string; end: string }>; 
   breaks: SchoolBreak[];
 }
 
@@ -45,11 +49,22 @@ export interface ScheduleItem {
   grade: string;      
   className: string;  
   room?: string;
+  isUnassigned?: boolean; // Flag for failed items
+  isBreak?: boolean; // Flag for break times
+}
+
+export interface ScheduleDiagnosis {
+  totalSlotsAvailable: number; // Total slots across all days (for one class)
+  slotCountsPerDay: Record<string, number>; // e.g. { Senin: 10, Jumat: 5 }
+  classLoad: Record<string, { needed: number, assigned: number, failed: number }>;
+  teacherLoad: Record<string, { assigned: number, failed: number }>;
+  unassignedItems: ScheduleItem[];
 }
 
 export interface ScheduleResponse {
   scheduleName: string;
   items: ScheduleItem[];
+  diagnosis: ScheduleDiagnosis;
 }
 
 export enum AppStatus {

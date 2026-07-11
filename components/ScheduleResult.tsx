@@ -1,7 +1,8 @@
 import React, { useState, useMemo } from 'react';
 import { ScheduleResponse, ScheduleItem } from '../types';
-import { Calendar, Download, Clock, Pencil, Save, X, FileSpreadsheet, Layers, Users, BookOpen, MapPin, Filter, Sparkles, BrainCircuit, AlertTriangle, Printer, Eye, Grid3X3, List } from 'lucide-react';
+import { Calendar, Download, Clock, Pencil, Save, X, FileSpreadsheet, Layers, Users, BookOpen, MapPin, Filter, Sparkles, BrainCircuit, AlertTriangle, Printer, Eye, Grid3X3, List, AlertOctagon, HelpCircle, Coffee } from 'lucide-react';
 import { analyzeScheduleWithAI } from '../services/geminiService';
+import { exportScheduleToExcel } from '../services/excelService';
 import ReactMarkdown from 'react-markdown';
 
 interface Props {
@@ -79,11 +80,11 @@ export const ScheduleResult: React.FC<Props> = ({ schedule, setSchedule }) => {
   const rawItems = isEditing ? editedItems : schedule.items;
   
   // Extract lists for dropdowns
-  const uniqueTeachersList = useMemo(() => Array.from(new Set(rawItems.map(i => i.teacher)))
+  const uniqueTeachersList = useMemo(() => Array.from(new Set(rawItems.filter(i => !i.isBreak).map(i => i.teacher)))
     .filter((name: string) => name && name.trim() !== '')
     .sort(), [rawItems]);
 
-  const uniqueClassesList = useMemo(() => Array.from(new Set(rawItems.map(i => i.className)))
+  const uniqueClassesList = useMemo(() => Array.from(new Set(rawItems.filter(i => !i.isBreak).map(i => i.className)))
     .filter((name: string) => name && name.trim() !== '')
     .sort(), [rawItems]);
 
@@ -92,10 +93,17 @@ export const ScheduleResult: React.FC<Props> = ({ schedule, setSchedule }) => {
   const currentItems = useMemo(() => {
     if (viewType === 'MATRIX') return rawItems.filter(i => i.day === matrixDay);
     
-    if (selectedFilter === 'ALL') return rawItems;
-    if (viewMode === 'TEACHER') return rawItems.filter(i => i.teacher === selectedFilter);
-    if (viewMode === 'CLASS') return rawItems.filter(i => i.className === selectedFilter);
-    return rawItems;
+    // For List view, we generally want to see Breaks too, unless specific filter hides them
+    let filtered = rawItems;
+
+    if (selectedFilter !== 'ALL') {
+        if (viewMode === 'TEACHER') {
+            filtered = rawItems.filter(i => i.teacher === selectedFilter || i.isBreak);
+        } else if (viewMode === 'CLASS') {
+            filtered = rawItems.filter(i => i.className === selectedFilter || i.isBreak);
+        }
+    }
+    return filtered;
   }, [rawItems, selectedFilter, viewMode, viewType, matrixDay]);
 
   // --- CONFLICT DETECTION LOGIC ---
@@ -106,6 +114,7 @@ export const ScheduleResult: React.FC<Props> = ({ schedule, setSchedule }) => {
      const classTimeMap = new Map<string, number[]>(); 
 
      rawItems.forEach((item, index) => {
+         if (item.isBreak) return; // Ignore breaks for conflicts
          if (!item.teacherCode || !item.timeSlot || !item.day) return;
 
          const teacherKey = `${item.day}|${item.timeSlot}|${item.teacherCode}`;
@@ -149,25 +158,11 @@ export const ScheduleResult: React.FC<Props> = ({ schedule, setSchedule }) => {
   }, [rawItems]);
 
   const hasConflicts = conflicts.size > 0;
+  const hasFailures = schedule.diagnosis?.unassignedItems?.length > 0;
 
-  // --- CSV Export ---
-  const downloadCSV = () => {
-    const headers = ["Hari", "No", "Kode Guru", "Nama Guru", "Mata Pelajaran", "Tingkat", "Kelas", "Ruangan", "Waktu"];
-    const csvContent = [
-      headers.join(","),
-      ...rawItems.map((item, idx) => 
-        `"${item.day}","${idx+1}","${item.teacherCode}","${item.teacher}","${item.subject}","${item.grade}","${item.className}","${item.room || '-'}","${item.timeSlot}"`
-      )
-    ].join("\n");
-
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.setAttribute("href", url);
-    link.setAttribute("download", `jadwal_pelajaran_full_${new Date().toISOString().slice(0,10)}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+  // --- EXCEL Export ---
+  const handleDownloadExcel = () => {
+      exportScheduleToExcel(schedule);
   };
 
   // --- List View Groups ---
@@ -191,15 +186,15 @@ export const ScheduleResult: React.FC<Props> = ({ schedule, setSchedule }) => {
         .filter(i => i.day === matrixDay);
       
       const timeSlots = Array.from(new Set(dayItems.map(i => i.timeSlot))).sort();
-      const classes = Array.from(new Set(dayItems.map(i => i.className))).sort();
+      const classes = Array.from(new Set(dayItems.filter(i => !i.isBreak).map(i => i.className))).sort();
 
       return { timeSlots, classes, items: dayItems };
   }, [rawItems, matrixDay, viewType]);
 
   // Stats
-  const uniqueClasses = new Set(rawItems.map(i => i.className)).size;
-  const totalHours = rawItems.length;
-  const activeTeachers = new Set(rawItems.map(i => i.teacherCode)).size;
+  const uniqueClasses = new Set(rawItems.filter(i => !i.isBreak).map(i => i.className)).size;
+  const totalHours = rawItems.filter(i => !i.isBreak).length;
+  const activeTeachers = new Set(rawItems.filter(i => !i.isBreak).map(i => i.teacherCode)).size;
 
   return (
     <div className="space-y-8 animate-fade-in">
@@ -246,6 +241,86 @@ export const ScheduleResult: React.FC<Props> = ({ schedule, setSchedule }) => {
                 <p className="text-red-700 text-sm mt-1">
                     Sistem mendeteksi adanya bentrok. Cek baris berwarna merah di tampilan daftar atau sel merah di tampilan grid.
                 </p>
+            </div>
+         </div>
+      )}
+
+      {/* --- DIAGNOSIS PANEL --- */}
+      {hasFailures && schedule.diagnosis && (
+         <div className="bg-orange-50 border border-orange-200 rounded-xl overflow-hidden shadow-sm no-print">
+            <div className="bg-orange-100/50 px-6 py-4 border-b border-orange-200 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                    <div className="bg-orange-100 p-2 rounded-full text-orange-600">
+                        <AlertOctagon size={24} />
+                    </div>
+                    <div>
+                        <h3 className="font-bold text-orange-900 text-lg">Diagnosa Kegagalan ({schedule.diagnosis.unassignedItems.length} JP)</h3>
+                        <p className="text-orange-700 text-xs">Beberapa mapel tidak muat masuk ke jadwal. Berikut analisanya.</p>
+                    </div>
+                </div>
+                <div className="text-right text-xs text-orange-800">
+                    <p>Total Kapasitas Sekolah: <b>{schedule.diagnosis.totalSlotsAvailable} Slot</b> / Kelas</p>
+                </div>
+            </div>
+            
+            <div className="p-6 grid grid-cols-1 md:grid-cols-2 gap-8">
+                {/* Cause 1: Class Overload */}
+                <div>
+                    <h4 className="font-bold text-slate-700 text-sm mb-3 flex items-center gap-2">
+                        <Layers size={16} className="text-slate-400"/> Analisa Beban Kelas (Capacity vs Demand)
+                    </h4>
+                    <div className="space-y-3 max-h-60 overflow-y-auto pr-2">
+                        {(Object.entries(schedule.diagnosis.classLoad) as [string, { needed: number, assigned: number, failed: number }][])
+                            .filter(([_, stats]) => stats.failed > 0)
+                            .sort((a,b) => b[1].failed - a[1].failed)
+                            .map(([cls, stats]) => {
+                                const capacity = schedule.diagnosis!.totalSlotsAvailable;
+                                const isOverload = stats.needed > capacity;
+                                
+                                return (
+                                    <div key={cls} className="bg-white p-3 rounded-lg border border-orange-100 shadow-sm text-xs">
+                                        <div className="flex justify-between mb-1">
+                                            <span className="font-bold text-slate-700">{cls}</span>
+                                            {isOverload && <span className="text-red-600 font-bold">OVERLOAD!</span>}
+                                        </div>
+                                        <div className="flex justify-between text-slate-500 mb-2">
+                                            <span>Butuh: {stats.needed} JP</span>
+                                            <span>Tersedia: {capacity} Slot</span>
+                                        </div>
+                                        {isOverload ? (
+                                            <div className="text-red-600 bg-red-50 p-2 rounded text-[11px] leading-tight">
+                                                Kelas ini butuh <b>{stats.needed} JP</b> tapi sekolah hanya punya <b>{capacity} JP</b> seminggu. 
+                                                <br/>Solusi: Kurangi mapel atau tambah jam pulang.
+                                            </div>
+                                        ) : (
+                                            <div className="text-orange-600 bg-orange-50 p-2 rounded text-[11px] leading-tight">
+                                                Kapasitas cukup, tapi gagal masuk karena <b>bentrok guru</b> atau <b>ketersediaan ruangan</b> di sisa slot sempit.
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                        })}
+                    </div>
+                </div>
+
+                {/* List of Failed Items */}
+                <div>
+                     <h4 className="font-bold text-slate-700 text-sm mb-3 flex items-center gap-2">
+                        <List size={16} className="text-slate-400"/> Daftar Mapel Gagal
+                    </h4>
+                    <div className="space-y-2 max-h-60 overflow-y-auto pr-2">
+                        {schedule.diagnosis.unassignedItems.map((item, idx) => (
+                            <div key={idx} className="flex justify-between items-center bg-white p-2 border border-slate-200 rounded text-xs text-slate-600">
+                                <div>
+                                    <span className="font-bold text-slate-800">{item.subject}</span>
+                                    <span className="text-slate-400 mx-1">•</span>
+                                    <span>{item.teacher}</span>
+                                </div>
+                                <span className="bg-slate-100 px-2 py-0.5 rounded font-mono text-slate-500">{item.className}</span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
             </div>
          </div>
       )}
@@ -322,10 +397,10 @@ export const ScheduleResult: React.FC<Props> = ({ schedule, setSchedule }) => {
                           <Printer size={16} /> Cetak
                       </button>
                       <button 
-                          onClick={downloadCSV}
+                          onClick={handleDownloadExcel}
                           className="flex items-center gap-2 text-sm font-semibold text-white bg-emerald-600 border border-transparent px-4 py-2 rounded-lg hover:bg-emerald-700 transition-all shadow-sm shadow-emerald-200"
                       >
-                          <FileSpreadsheet size={16} /> Unduh CSV
+                          <FileSpreadsheet size={16} /> Excel Full
                       </button>
                   </>
               ) : (
@@ -441,7 +516,7 @@ export const ScheduleResult: React.FC<Props> = ({ schedule, setSchedule }) => {
                             {matrixData.classes.map(cls => (
                                 <th key={cls} className="p-3 bg-indigo-50 border border-slate-300 font-bold text-indigo-800 text-center min-w-[120px]">
                                     Kelas {cls}
-                                </span>
+                                </th>
                             ))}
                         </tr>
                     </thead>
@@ -452,8 +527,23 @@ export const ScheduleResult: React.FC<Props> = ({ schedule, setSchedule }) => {
                                     {time}
                                 </th>
                                 {matrixData.classes.map(cls => {
-                                    // Find item for this cell
-                                    const cellItem = matrixData.items.find(i => i.timeSlot === time && i.className === cls);
+                                    // 1. Try to find a BREAK for this time first
+                                    const breakItem = matrixData.items.find(i => i.timeSlot === time && i.isBreak);
+                                    if (breakItem) {
+                                        // This slot is a break. Since we iterate classes, we should only render this cell ONCE spanning all cols
+                                        // OR render it in every cell. 
+                                        // Easier: Render it in every cell but with distinct style
+                                        return (
+                                            <td key={`${time}-${cls}`} className="p-2 border border-slate-300 h-10 bg-amber-50 align-middle text-center">
+                                                <div className="flex items-center justify-center gap-1 text-amber-700 font-bold opacity-50">
+                                                    <Coffee size={12}/> {breakItem.subject}
+                                                </div>
+                                            </td>
+                                        )
+                                    }
+
+                                    // 2. Find regular item
+                                    const cellItem = matrixData.items.find(i => i.timeSlot === time && i.className === cls && !i.isBreak);
                                     
                                     // Check conflict
                                     const conflictReasons = cellItem ? conflicts.get(cellItem.originalIndex) : null;
@@ -530,6 +620,22 @@ export const ScheduleResult: React.FC<Props> = ({ schedule, setSchedule }) => {
                   </thead>
                   <tbody className="divide-y divide-slate-100 bg-white">
                     {group.items.map((item, idx) => {
+                       if (item.isBreak) {
+                           return (
+                               <tr key={idx} className="bg-amber-50 text-amber-700">
+                                   <td className="px-6 py-3 text-center border-r border-amber-100 font-bold text-xs" colSpan={1}>
+                                       -
+                                   </td>
+                                   <td className="px-6 py-3 font-mono font-bold text-xs border-r border-amber-100">
+                                       {item.timeSlot}
+                                   </td>
+                                   <td className="px-6 py-3 font-bold text-center text-xs tracking-widest uppercase" colSpan={4}>
+                                       ☕ {item.subject}
+                                   </td>
+                               </tr>
+                           );
+                       }
+
                        const conflictReasons = conflicts.get(item.originalIndex);
                        const isConflict = conflictReasons && conflictReasons.length > 0;
                        

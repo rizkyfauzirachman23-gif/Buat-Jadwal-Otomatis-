@@ -1,69 +1,66 @@
-import { GoogleGenAI, Type } from "@google/genai";
-import { Teacher, ScheduleResponse, PlaceResult, TimeSettings, SchoolBreak } from "../types";
+import { Teacher, ScheduleResponse, PlaceResult, TimeSettings, ScheduleItem } from "../types";
 
-const apiKey = process.env.API_KEY || '';
-const ai = new GoogleGenAI({ apiKey });
+// --- UTILITIES ---
 
-// Helper to clean AI response
-const cleanJsonText = (text: string): string => {
-  if (!text) return "{}";
-  let cleaned = text.replace(/```json/g, "").replace(/```/g, "");
-  return cleaned.trim();
-};
-
-// --- SMART TIME SLOT CALCULATOR ---
-// Calculates valid slots based on start time, generic duration (e.g. 40mins), and breaks.
-const calculateValidTimeSlots = (settings: TimeSettings, defaultDuration: number = 40): string[] => {
+const calculateValidTimeSlots = (
+    settings: TimeSettings, 
+    specificDay?: string, 
+    defaultDuration: number = 40 
+): string[] => {
     const slots: string[] = [];
     
-    // Helper to convert "HH:MM" to minutes from midnight
+    const duration = settings.lessonDuration || 40;
+
+    let startStr = settings.startHour;
+    let endStr = settings.endHour;
+
+    if (specificDay && settings.dailyOverrides && settings.dailyOverrides[specificDay]) {
+        startStr = settings.dailyOverrides[specificDay].start;
+        endStr = settings.dailyOverrides[specificDay].end;
+    }
+
     const toMins = (time: string) => {
+        if(!time) return 0;
         const [h, m] = time.split(':').map(Number);
         return h * 60 + m;
     };
 
-    // Helper to convert minutes from midnight to "HH:MM"
     const toTimeStr = (totalMins: number) => {
         const h = Math.floor(totalMins / 60);
         const m = totalMins % 60;
         return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
     };
 
-    let currentMins = toMins(settings.startHour);
-    const endMins = toMins(settings.endHour);
+    let currentMins = toMins(startStr);
+    const endMins = toMins(endStr);
     
-    // Parse breaks into ranges
     const breakRanges = settings.breaks.map(b => ({
         start: toMins(b.startTime),
         end: toMins(b.endTime),
         name: b.name
-    }));
+    })).sort((a,b) => a.start - b.start);
 
-    // Safety loop limit
+    if (currentMins >= endMins) return [];
+
     let iterations = 0;
-    while (currentMins + defaultDuration <= endMins && iterations < 50) {
+    while (currentMins + duration <= endMins && iterations < 50) {
         iterations++;
         
-        // Check if current start time is inside a break
         const overlappingBreak = breakRanges.find(b => currentMins >= b.start && currentMins < b.end);
-        
         if (overlappingBreak) {
-            // Skip to end of break
             currentMins = overlappingBreak.end;
             continue;
         }
 
-        const nextMins = currentMins + defaultDuration;
+        const nextMins = currentMins + duration;
 
-        // Check if the proposed slot [current, next] overlaps with a break
-        // We define overlap if the slot cuts into a break
         const breakInSlot = breakRanges.find(b => 
-            (currentMins < b.start && nextMins > b.start) // Slot starts before break, ends after break starts
+            (currentMins < b.start && nextMins > b.start) || 
+            (currentMins <= b.start && nextMins >= b.end) || 
+            (currentMins > b.start && nextMins < b.end)     
         );
 
         if (breakInSlot) {
-            // If a break interrupts this slot, we push the start time to the end of the break
-            // (Assuming we don't split classes across breaks for simplicity, or we treat this gap as break time)
             currentMins = breakInSlot.end;
             continue;
         }
@@ -79,159 +76,353 @@ const calculateValidTimeSlots = (settings: TimeSettings, defaultDuration: number
     return slots;
 };
 
+// --- CORE ALGORITHM: STRICT CONFLICT PREVENTER ---
+
+interface AssignmentState {
+    id: string;
+    teacherId: string;
+    teacherCode: string;
+    teacherName: string;
+    subject: string;
+    className: string;
+    grade: string;
+    room: string;
+    totalNeeded: number;
+    remaining: number;
+    maxConsecutive: number;
+}
+
+interface RuntimeState {
+    // Tracks consecutive sessions for a class: "ClassID" -> { subject: "Math", count: 1, teacherId: "T1" }
+    lastSlotClassState: Record<string, { subject: string, count: number, teacherId: string } | null>;
+    teacherLoadRemaining: Record<string, number>;
+}
+
 export const generateSchedule = async (
   teachers: Teacher[],
   days: string[],
   timeSettings: TimeSettings
 ): Promise<ScheduleResponse> => {
-  if (!apiKey) throw new Error("API Key not found");
-
-  // 1. Calculate Valid Time Slots using logic (Math) instead of AI guessing
-  // We take the mode duration (most common) or default to 40 for slot generation
-  // In a complex app, we might support variable slots, but fixed slots are safer for AI.
-  const validSlots = calculateValidTimeSlots(timeSettings, 40); 
-  const validSlotsString = validSlots.join(', ');
-
-  // 2. Extract Context
-  const derivedClasses = Array.from(new Set(
-    teachers.flatMap(t => t.assignments.map(a => a.classes))
-  )).filter(c => c && c.trim() !== '').join(', ');
-
-  const classListInfo = derivedClasses.length > 0 
-    ? `Target Classes (extracted from assignments): ${derivedClasses}`
-    : `Assume realistic classes for a secondary school (e.g. 7A, 7B, 8A...).`;
-
-  const teacherConstraints = teachers.map(t => {
-      const assignments = t.assignments.map(a => 
-          `   - Subject: "${a.subjectName}"
-             - Duration: ${a.duration} mins
-             - REQUIRED FREQUENCY (Total Weekly JP): ${a.weeklyCount} sessions/week
-             - MAX CONSECUTIVE SESSIONS per day: ${a.maxConsecutiveSessions} (Strict limit)
-             - REQUIRED ROOM: ${a.reqRoom}
-             - Target: Grade ${a.grade || 'Any'}, Classes: ${a.classes || 'Any'}`
-      ).join('\n');
-      
-      const unavailable = t.unavailableDays && t.unavailableDays.length > 0 
-          ? `   - CONSTRAINT: UNAVAILABLE on days: ${t.unavailableDays.join(', ')}` 
-          : '';
-
-      return `Teacher: ${t.name} (Code: ${t.code})\n${unavailable}\n${assignments}`;
-  }).join('\n\n');
-
-  const prompt = `
-    Create a detailed, optimized, and conflict-free school schedule (Jadwal Pelajaran).
-
-    --- CRITICAL TIME CONFIGURATION ---
-    Use ONLY these exact Time Slots for lessons. Do not invent new times:
-    [${validSlotsString}]
     
-    (Note: Breaks are implicitly the gaps between these slots if any, or specific times defined below).
-    Global School Hours: ${timeSettings.startHour} - ${timeSettings.endHour}.
+    // 1. Setup Time Slots
+    const daySlotsMap: Record<string, string[]> = {};
+    const slotCountsPerDay: Record<string, number> = {};
+    let totalSlotsAvailable = 0;
 
-    --- INPUT DATA ---
-    Days: ${days.join(', ')}
-    
-    TEACHER ASSIGNMENTS:
-    ${teacherConstraints}
+    // Strict Priority: Mon-Thu (Full days) -> Fri-Sat (Short/Overflow)
+    const dayOrderPriority = ['senin', 'selasa', 'rabu', 'kamis', 'jumat', 'sabtu', 'minggu'];
+    const sortedDays = [...days].sort((a, b) => {
+        const idxA = dayOrderPriority.indexOf(a.toLowerCase());
+        const idxB = dayOrderPriority.indexOf(b.toLowerCase());
+        return idxA - idxB;
+    });
 
-    CLASS CONTEXT:
-    ${classListInfo}
+    for (const day of sortedDays) {
+        const slots = calculateValidTimeSlots(timeSettings, day);
+        daySlotsMap[day] = slots;
+        slotCountsPerDay[day] = slots.length;
+        totalSlotsAvailable += slots.length;
+    }
     
-    --- RULES (ALGORITMA DEWA) ---
-    1. **Format**: Valid JSON only.
-    2. **Conflict Zero**: No teacher in 2 classes at once. No room used twice at once. No class has 2 teachers at once.
-    3. **Time Slots**: You MUST use the exact strings provided in the "Time Slots" list above.
-    4. **Distribution**: Spread the "Weekly JP" across valid days. Do not clump everything in one day.
-    5. **Consecutive Limit**: Respect 'maxConsecutiveSessions'. If a subject needs 4 JP/week and max is 2, split it into 2 days (2 JP each).
-    6. **Room Logic**: If 'reqRoom' is 'Lab', assign it. If 'Kelas Biasa', assume the class stays in their homeroom.
-    
-    Return a JSON object with a list of schedule items.
-  `;
+    if (totalSlotsAvailable === 0) throw new Error("Pengaturan waktu tidak valid atau 0 slot tersedia.");
 
-  // RETRY LOGIC (The "Dewa" Touch)
-  const attemptGeneration = async (retryCount = 0): Promise<ScheduleResponse> => {
-      try {
-        const response = await ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: prompt,
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                scheduleName: { type: Type.STRING },
-                items: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      day: { type: Type.STRING },
-                      timeSlot: { type: Type.STRING },
-                      subject: { type: Type.STRING },
-                      teacher: { type: Type.STRING },
-                      teacherCode: { type: Type.STRING },
-                      grade: { type: Type.STRING },
-                      className: { type: Type.STRING },
-                      room: { type: Type.STRING }
-                    },
-                    required: ["day", "timeSlot", "subject", "teacher", "teacherCode", "grade", "className"]
-                  }
-                }
-              },
-              required: ["scheduleName", "items"]
-            }
-          }
+    // 2. Initialize Workload State
+    const allAssignments: AssignmentState[] = [];
+    const allUniqueClasses = new Set<string>();
+    const teacherLoadRemaining: Record<string, number> = {}; // TeacherID -> Total Hours Left
+
+    teachers.forEach(t => {
+        let tTotal = 0;
+        t.assignments.forEach(assign => {
+            const classList = assign.classes.split(',').map(c => c.trim()).filter(c => c);
+            classList.forEach(className => {
+                allUniqueClasses.add(className);
+                allAssignments.push({
+                    id: `${t.code}-${className}-${assign.subjectName}-${Math.random().toString(36).substr(2, 5)}`,
+                    teacherId: t.id,
+                    teacherCode: t.code,
+                    teacherName: t.name,
+                    subject: assign.subjectName,
+                    className: className,
+                    grade: assign.grade,
+                    room: assign.reqRoom,
+                    totalNeeded: assign.weeklyCount,
+                    remaining: assign.weeklyCount,
+                    maxConsecutive: assign.maxConsecutiveSessions || 2
+                });
+                tTotal += assign.weeklyCount;
+            });
         });
+        teacherLoadRemaining[t.id] = tTotal;
+    });
 
-        const text = response.text;
-        if (!text) throw new Error("No response from Gemini");
+    const runtime: RuntimeState = {
+        lastSlotClassState: {},
+        teacherLoadRemaining
+    };
+
+    const finalSchedule: ScheduleItem[] = [];
+    
+    // 3. MAIN LOOP: Day -> Slot -> Greedy Allocation
+    for (const day of sortedDays) {
+        const slots = daySlotsMap[day] || [];
         
-        const cleanedText = cleanJsonText(text);
-        return JSON.parse(cleanedText) as ScheduleResponse;
+        // Reset daily consecutive tracking for new day
+        runtime.lastSlotClassState = {}; 
 
-      } catch (error: any) {
-          if (retryCount < 1) {
-              console.warn("Generation failed, retrying once...", error);
-              return attemptGeneration(retryCount + 1);
-          }
-          throw error;
-      }
-  };
+        for (const slot of slots) {
+            
+            // TRACKING BUSY RESOURCES FOR THIS EXACT SLOT (07:00 - 07:40)
+            const slotTeacherOccupied = new Set<string>(); // Uses Teacher ID
+            const slotTeacherCodeOccupied = new Set<string>(); // Uses Teacher Code (Prevent Duplicate Person Conflict)
+            const slotClassOccupied = new Set<string>();
+            const slotRoomOccupied = new Set<string>();
 
-  try {
-      return await attemptGeneration();
-  } catch (error: any) {
-    console.error("Gemini Generation Final Error:", error);
-    throw new Error(error.message || "Gagal membuat jadwal. Silakan coba lagi.");
-  }
+            // We want to fill as many classes as possible in this slot.
+            
+            let madeMove = true;
+            while (madeMove) {
+                madeMove = false;
+
+                // Identify potential moves
+                const candidates: { assignmentIdx: number, score: number }[] = [];
+
+                for (let i = 0; i < allAssignments.length; i++) {
+                    const asg = allAssignments[i];
+                    
+                    // --- CRITICAL CONFLICT CHECKS ---
+                    
+                    // 1. Is this assignment already finished?
+                    if (asg.remaining <= 0) continue; 
+                    
+                    // 2. Is the Class already studying something else this slot?
+                    if (slotClassOccupied.has(asg.className)) continue; 
+                    
+                    // 3. Is the Teacher already teaching in another class this slot? (Check ID)
+                    if (slotTeacherOccupied.has(asg.teacherId)) continue; 
+
+                    // 4. Is the Teacher CODE busy? (Handles manual duplicate entries of same person)
+                    if (slotTeacherCodeOccupied.has(asg.teacherCode)) continue;
+                    
+                    // 5. Is the Special Room busy?
+                    if (asg.room !== 'Kelas Biasa' && slotRoomOccupied.has(asg.room)) continue; 
+
+                    // 6. Is the Teacher available on this day?
+                    const teacherObj = teachers.find(t => t.id === asg.teacherId);
+                    if (teacherObj?.unavailableDays?.includes(day)) continue;
+
+                    // --- SCORING SYSTEM ---
+                    let score = 0;
+
+                    // 1. CONTINUATION BONUS (Highest Priority)
+                    // Keeps blocks together (e.g. 2 hours of Math back-to-back)
+                    const lastState = runtime.lastSlotClassState[asg.className];
+                    const isContinuation = lastState && lastState.subject === asg.subject && lastState.teacherId === asg.teacherId;
+                    
+                    if (isContinuation) {
+                        if (lastState.count < asg.maxConsecutive) {
+                            score += 50000; // HUGE bonus to prevent interruption
+                        } else {
+                            score -= 10000; // Max consecutive reached. Force switch.
+                        }
+                    } else if (lastState) {
+                        // Switching subjects
+                        score += 100;
+                    } else {
+                        // First slot of day
+                        score += 100;
+                    }
+
+                    // 2. TEACHER LOAD & VARIETY
+                    // If a teacher has a lot of hours left, prioritize them.
+                    const tLoad = runtime.teacherLoadRemaining[asg.teacherId] || 0;
+                    score += (tLoad * 100); 
+
+                    // 3. REMAINING HOURS SPECIFIC SUBJECT
+                    score += (asg.remaining * 50);
+
+                    // 4. ROOM PRIORITY (Labs are scarce)
+                    if (asg.room !== 'Kelas Biasa') score += 1000;
+
+                    // 5. RANDOM NOISE (Break ties to prevent deterministic lockups)
+                    score += Math.random() * 10;
+
+                    candidates.push({ assignmentIdx: i, score });
+                }
+
+                // C. Pick Best Candidate
+                if (candidates.length > 0) {
+                    // Sort descending
+                    candidates.sort((a, b) => b.score - a.score);
+                    
+                    const best = candidates[0];
+                    const bestAsg = allAssignments[best.assignmentIdx];
+
+                    // EXECUTE MOVE
+                    finalSchedule.push({
+                        day,
+                        timeSlot: slot,
+                        subject: bestAsg.subject,
+                        teacher: bestAsg.teacherName,
+                        teacherCode: bestAsg.teacherCode,
+                        grade: bestAsg.grade,
+                        className: bestAsg.className,
+                        room: bestAsg.room
+                    });
+
+                    // Update State
+                    bestAsg.remaining--;
+                    runtime.teacherLoadRemaining[bestAsg.teacherId]--;
+                    
+                    // Mark Occupied (Crucial for next iteration of `while(madeMove)`)
+                    slotTeacherOccupied.add(bestAsg.teacherId);
+                    slotTeacherCodeOccupied.add(bestAsg.teacherCode); // Block this code globally for this slot
+                    slotClassOccupied.add(bestAsg.className);
+                    if (bestAsg.room !== 'Kelas Biasa') slotRoomOccupied.add(bestAsg.room);
+
+                    // Update Consecutive State
+                    const prevCount = (runtime.lastSlotClassState[bestAsg.className]?.subject === bestAsg.subject) 
+                        ? runtime.lastSlotClassState[bestAsg.className]!.count 
+                        : 0;
+                    
+                    runtime.lastSlotClassState[bestAsg.className] = {
+                        subject: bestAsg.subject,
+                        teacherId: bestAsg.teacherId,
+                        count: prevCount + 1
+                    };
+
+                    madeMove = true; 
+                }
+            }
+            
+            // End of Slot Processing for this Class
+            // If a class wasn't assigned anything in this slot, clear its consecutive state
+            allUniqueClasses.forEach(cls => {
+                if (!slotClassOccupied.has(cls)) {
+                    runtime.lastSlotClassState[cls] = null;
+                }
+            });
+        }
+    }
+
+    // 4. Inject Breaks (Visual)
+    sortedDays.forEach(day => {
+        const slots = calculateValidTimeSlots(timeSettings, day);
+        if (slots.length === 0) return;
+
+        const dayStartStr = timeSettings.dailyOverrides?.[day]?.start || timeSettings.startHour;
+        const dayEndStr = timeSettings.dailyOverrides?.[day]?.end || timeSettings.endHour;
+        const dStart = parseInt(dayStartStr.replace(':', ''));
+        const dEnd = parseInt(dayEndStr.replace(':', ''));
+
+        timeSettings.breaks.forEach(b => {
+            const bStart = parseInt(b.startTime.replace(':', ''));
+            const bEnd = parseInt(b.endTime.replace(':', ''));
+            
+            if (bStart >= dStart && bEnd <= dEnd) {
+                 finalSchedule.push({
+                    day: day,
+                    timeSlot: `${b.startTime} - ${b.endTime}`,
+                    subject: b.name,
+                    teacher: '-',
+                    teacherCode: '',
+                    grade: '',
+                    className: '',
+                    room: '-',
+                    isBreak: true
+                });
+            }
+        });
+    });
+
+    // 5. Diagnostics
+    const classLoadStats: Record<string, { needed: number, assigned: number, failed: number }> = {};
+    const teacherLoadStats: Record<string, { assigned: number, failed: number }> = {};
+    const unassignedItems: ScheduleItem[] = [];
+
+    // Init stats
+    allAssignments.forEach(a => {
+        if(!classLoadStats[a.className]) classLoadStats[a.className] = { needed: 0, assigned: 0, failed: 0 };
+        classLoadStats[a.className].needed += a.totalNeeded;
+    });
+
+    // Count Success
+    finalSchedule.forEach(item => {
+        if(item.isBreak) return;
+        if(classLoadStats[item.className]) classLoadStats[item.className].assigned++;
+        
+        if(!teacherLoadStats[item.teacherCode]) teacherLoadStats[item.teacherCode] = { assigned: 0, failed: 0 };
+        teacherLoadStats[item.teacherCode].assigned++;
+    });
+
+    // Collect Failures
+    allAssignments.forEach(a => {
+        if (a.remaining > 0) {
+            for(let k=0; k<a.remaining; k++) {
+                unassignedItems.push({
+                    day: 'Gagal',
+                    timeSlot: '-',
+                    subject: a.subject,
+                    teacher: a.teacherName,
+                    teacherCode: a.teacherCode,
+                    grade: a.grade,
+                    className: a.className,
+                    room: a.room,
+                    isUnassigned: true
+                });
+                if(classLoadStats[a.className]) classLoadStats[a.className].failed++;
+                if(!teacherLoadStats[a.teacherCode]) teacherLoadStats[a.teacherCode] = { assigned:0, failed:0 };
+                teacherLoadStats[a.teacherCode].failed++;
+            }
+        }
+    });
+
+    finalSchedule.sort((a, b) => {
+        const dayDiff = sortedDays.indexOf(a.day) - sortedDays.indexOf(b.day);
+        if (dayDiff !== 0) return dayDiff;
+        return a.timeSlot.localeCompare(b.timeSlot);
+    });
+
+    const totalHoursRequired = allAssignments.reduce((acc, a) => acc + a.totalNeeded, 0);
+    const totalFailed = unassignedItems.length;
+    const successRate = totalHoursRequired > 0 
+        ? Math.round(((totalHoursRequired - totalFailed) / totalHoursRequired) * 100) 
+        : 100;
+    
+    let title = totalFailed === 0 
+        ? "Jadwal Sempurna (100% Terisi)" 
+        : `Jadwal (${successRate}% Terisi - Gagal ${totalFailed} JP)`;
+
+    return {
+        scheduleName: title,
+        items: finalSchedule,
+        diagnosis: {
+            totalSlotsAvailable,
+            slotCountsPerDay,
+            classLoad: classLoadStats,
+            teacherLoad: teacherLoadStats,
+            unassignedItems
+        }
+    };
 };
 
+// --- ANALYTICS ---
 export const analyzeScheduleWithAI = async (schedule: ScheduleResponse): Promise<string> => {
-  if (!apiKey) throw new Error("API Key not found");
-
-  const prompt = `
-    Act as an expert School Academic Consultant. Analyze the following school schedule JSON data deeply:
-    
-    ${JSON.stringify(schedule.items.slice(0, 150))} (Data sample provided)
-
-    Please provide a sophisticated analysis report in Markdown format with the following sections:
-
-    1.  **📊 Efficiency Score (0-100)**: Give a score based on conflict avoidance and distribution.
-    2.  **⚠️ Burnout Alerts**: Identify if any teacher acts continuously without breaks or exceeds daily limits.
-    3.  **⚖️ Distribution Balance**: Are heavy subjects (Math, IPA) distributed or clumped?
-    4.  **💡 Optimization Suggestions**: Specific actionable advice.
-    5.  **🏆 Best Feature**: One thing this schedule did really well.
-
-    Keep the tone professional, encouraging, and insightful. Use Indonesian language.
-  `;
-
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: prompt,
+    const response = await fetch("/api/analyze-schedule", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ schedule }),
     });
-    return response.text || "Gagal menganalisis jadwal.";
+
+    if (!response.ok) {
+      throw new Error("Failed to analyze schedule");
+    }
+
+    const data = await response.json();
+    return data.text || "Gagal menganalisis jadwal.";
   } catch (e) {
+    console.error("Analysis Error:", e);
     return "Maaf, analisis AI sedang tidak dapat digunakan saat ini.";
   }
 };
@@ -241,41 +432,19 @@ export const searchNearbyPlaces = async (
   longitude: number,
   query: string
 ): Promise<{ text: string; places: PlaceResult[] }> => {
-  if (!apiKey) throw new Error("API Key not found");
-
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: `Find actual real places near me related to: ${query}. List top 5 recommendations with a short reason why.`,
-      config: {
-        tools: [{ googleMaps: {} }],
-        toolConfig: {
-          retrievalConfig: {
-            latLng: {
-              latitude: latitude,
-              longitude: longitude
-            }
-          }
-        }
-      }
+    const response = await fetch("/api/nearby-places", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ latitude, longitude, query }),
     });
 
-    const text = response.text || "Tidak ada rekomendasi ditemukan.";
-    
-    const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-    const places: PlaceResult[] = [];
+    if (!response.ok) {
+      throw new Error("Failed to fetch nearby places");
+    }
 
-    chunks.forEach((chunk: any) => {
-      if (chunk.maps) {
-        places.push({
-          title: chunk.maps.title,
-          uri: chunk.maps.uri,
-          address: chunk.maps.address,
-        });
-      }
-    });
-
-    return { text, places };
+    const data = await response.json();
+    return { text: data.text, places: data.places };
   } catch (error) {
     console.error("Map Error", error);
     throw new Error("Gagal mengambil data lokasi.");
